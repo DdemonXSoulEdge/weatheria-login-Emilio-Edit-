@@ -1,151 +1,130 @@
-import sys
+import requests
+import json
+import time
+import csv
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from datetime import datetime
+from firebase import firebase
 
-from flask import Flask, jsonify, request
-from werkzeug.security import generate_password_hash, check_password_hash
-import re
-import sqlite3
-from flask_cors import CORS
-from dotenv import load_dotenv
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-import datetime
-import googlemaps
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+API_KEY = "c64e8a47b0f348298e8a47b0f3f829cd"
+STATION_ID = "ISANTI245"
+FIREBASE_URL = "https://weatheriadx-default-rtdb.firebaseio.com/"
 
-load_dotenv()
+db = firebase.FirebaseApplication(FIREBASE_URL, None)
 
-# === APP + GUNICORN (para Render) ===
-app = Flask(__name__)
-application = app  # ← ¡¡ESTO ES OBLIGATORIO PARA RENDER!!
+# 🔧 BASE_DIR siempre apunta al directorio real donde está este archivo
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CORS(app)
+LAST_TS_FILE = os.path.join(BASE_DIR, "last_timestamp.txt")
+JSON_FILE = os.path.join(BASE_DIR, "registros.json")
+OUTPUT_DIR = os.path.join(BASE_DIR, "history")
 
-# JWT
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'tu_clave_secreta_super_fuerte')
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = datetime.timedelta(minutes=30)
-jwt = JWTManager(app)
 
-# Google Maps
-API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
-if not API_KEY:
-    raise ValueError("Clave de API de Google Maps no encontrada")
-gmaps = googlemaps.Client(key=API_KEY)
-
-# Base de datos
-DB_PATH = os.path.join(os.path.dirname(__file__), 'database.db')
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password TEXT NOT NULL,
-            status INTEGER NOT NULL
-        )
-    ''')
-    initial_users = [
-        ("username1", generate_password_hash("Hola.123"), 1),
-        ("username2", generate_password_hash("Hola.123"), 1),
-        ("username3", generate_password_hash("Hola.123"), 1),
-        ("username4", generate_password_hash("Hola.123"), 1)
-    ]
-    for username, hashed_password, status in initial_users:
-        cursor.execute("INSERT OR IGNORE INTO users (username, password, status) VALUES (?, ?, ?)",
-                       (username, hashed_password, status))
-    conn.commit()
-    conn.close()
-
-def validate_username(username: str) -> bool:
-    return bool(username and 3 <= len(username) <= 50 and re.match(r'^[a-zA-Z0-9_]+$', username))
-
-# === RUTAS ===
-
-@app.route('/')
-def health_check():
-    return jsonify({'message': 'Backend funcionando correctamente'})
-
-# LOGIN → devuelve exactamente lo que espera tu frontend
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    if not data or 'username' not in data or 'password' not in data:
-        return jsonify({"message": "Faltan username o password"}), 400
-
-    username = data['username'].strip()
-    password = data['password']
-
-    if not validate_username(username):
-        return jsonify({"message": "Username inválido"}), 400
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT password, status FROM users WHERE username = ?", (username,))
-    user = cursor.fetchone()
-    conn.close()
-
-    if not user:
-        return jsonify({"message": "Usuario no encontrado"}), 404
-    if user[1] != 1:
-        return jsonify({"message": "Usuario inactivo"}), 403
-    if not check_password_hash(user[0], password):
-        return jsonify({"message": "Contraseña incorrecta"}), 401
-
-    token = create_access_token(identity=username)
-    return jsonify({
-        "message": "Login exitoso",
-        "token": token,
-        "username": username
-    }), 200
-
-# REPORTAR INUNDACIÓN → PROTEGIDO CON JWT Y ENVÍA CORREO
-@app.route('/report_flood', methods=['POST'])
-@jwt_required()                     # ← requiere login
-def report_flood():
-    current_user = get_jwt_identity()  # ← toma el usuario del token
-    data = request.get_json()
-
-    required = ['ubicacion', 'fecha', 'temperatura', 'descripcion_clima', 'mensaje']
-    if not all(k in data for k in required):
-        return jsonify({"message": "Todos los campos son requeridos"}), 400
-
-    SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
-    SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
-    COMPANY_EMAIL = os.environ.get("COMPANY_EMAIL")
-
-    if not all([SENDGRID_API_KEY, SENDER_EMAIL, COMPANY_EMAIL]):
-        return jsonify({"message": "Error de configuración del servidor"}), 500
-
-    body = f"""
-Se ha recibido un reporte de inundación desde la app Weatheria.
-
-Usuario: {current_user}
-Ubicación: {data['ubicacion']}
-Fecha: {data['fecha']}
-Temperatura: {data['temperatura']}°C
-Descripción del clima: {data['descripcion_clima']}
-Mensaje: {data['mensaje']}
-
-Verificar inmediatamente la zona reportada.
-    """
-
-    email = Mail(
-        from_email=SENDER_EMAIL,
-        to_emails=COMPANY_EMAIL,
-        subject="Reporte de Inundación - Weatheria App",
-        plain_text_content=body
+def get_data():
+    """Obtiene datos meteorológicos actuales desde Weather.com"""
+    url = (
+        f"https://api.weather.com/v2/pws/observations/current?"
+        f"stationId={STATION_ID}&format=json&units=m&apiKey={API_KEY}"
     )
 
     try:
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(email)
-        print("EMAIL ENVIADO →", response.status_code)
-        return jsonify({"message": "Reporte enviado exitosamente"}), 200
-    except Exception as e:
-        print("ERROR SENDGRID →", str(e))
-        return jsonify({"message": "Error al enviar el reporte"}), 500
+        response = requests.get(url)
+        response.raise_for_status()
+        datos = response.json()
+        datos["local_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return datos
+    except requests.exceptions.RequestException as e:
+        print(f"[{datetime.now()}] Error al obtener datos: {e}")
+        return None
 
-# === INICIALIZAR DB ===
-init_db()
+
+def process_and_upload(datos):
+    """Procesa los datos y los sube a Firebase"""
+    try:
+        obs = datos["observations"][0]
+        metric = obs["metric"]
+
+        registro = {
+            "temp": metric.get("temp"),
+            "heatIndex": metric.get("heatIndex"),
+            "dewpt": metric.get("dewpt"),
+            "windChill": metric.get("windChill"),
+            "windSpeed": metric.get("windSpeed"),
+            "windGust": metric.get("windGust"),
+            "humidity": obs.get("humidity"),
+            "pressure": metric.get("pressure"),
+            "precipRate": metric.get("precipRate"),
+            "precipTotal": metric.get("precipTotal"),
+            "timestamp": datos["local_timestamp"]
+        }
+
+        db.post("/registros", registro)
+        print(f"[{registro['timestamp']}] Datos subidos a Firebase:", registro)
+        return registro
+
+    except Exception as e:
+        print(f"[Error al subir datos a Firebase: {e}]")
+        return None
+
+
+def save_to_csv_firebase(registro):
+    fecha = datetime.now().strftime("%Y-%m-%d")
+
+    try:
+        existing = db.get("/csv_history", fecha)
+
+        if isinstance(existing, str):
+            existing = []
+
+        if not existing:
+            existing = []
+
+        existing.append(registro)
+
+        db.put("/csv_history", fecha, existing)
+
+        print(f"Registro agregado al historial del día {fecha}")
+
+    except Exception as e:
+        print("Error guardando historial:", e)
+
+
+def save_to_json(registros):
+    try:
+        db.put("/", "json_data", registros)
+        print(f"[{datetime.now()}] Datos JSON subidos a Firebase (/json_data)")
+    except Exception as e:
+        print(f"Error JSON Firebase: {e}")
+
+
+def load_existing_data():
+    try:
+        data = db.get("/json_data", None)
+        return data if data else []
+    except:
+        return []
+
+
+def main_loop():
+    print("🌦️ Sistema Weatheria iniciado (sincronización cada 15 minutos).")
+    all_records = load_existing_data()
+
+    while True:
+        datos = get_data()
+
+        if datos:
+            registro = process_and_upload(datos)
+
+            if registro:
+                all_records.append(registro)
+                save_to_csv_firebase(registro)
+                save_to_json(all_records)
+        else:
+            print(f"[{datetime.now()}] No se obtuvieron datos válidos, reintentando...")
+
+        print("⏳ Esperando 15 minutos para la siguiente actualización...\n")
+        time.sleep(900)  # 900 segundos = 15 minutos
+
+
+if __name__ == "__main__":
+    main_loop()
